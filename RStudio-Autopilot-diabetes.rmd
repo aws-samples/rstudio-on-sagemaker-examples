@@ -1,0 +1,267 @@
+---
+title: "RStudio-Autopilot-diabetes"
+output: rmarkdown::github_document
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "rendered") })
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+---
+
+In this notebook, we are going to train a Machine Learning classification model using Amazon SageMaker Autopilot, on the diabetes dataset found here: https://archive.ics.uci.edu/ml/datasets/diabetes+130-us+hospitals+for+years+1999-2008#
+The goal of this problem is to classify whether a patient is going to be readmitted to the hospital due to diabetes related problems, given various test results, previous diagnosis, demographics and previous admission related data. More information on the dataset can be found in the url posted above and the articles sited on the site.
+
+We will carry out the following tasks in this notebook:
+
+1. Set up required packages, Amazon SageMaker Python SDK, role, session and Amazon S3 bucket
+2. Download the data, do simple preprocessing and store the data in an S3 bucket for model training
+3. Setup and run the SageMaker AutoPilot job with a number of candidates. Each candidate consists of some auto feature engineering steps and a machine learning algorithm picked to run a trial
+4. Select the best candidate out of all the models trained based on a objective metric
+5. Run batch inference using the best candidate on the test data set
+6. Display various metrics like accuracy, sensitivity, accuracy, F-1 score and confusion matrix
+7. Plot the receover operating characteristic (ROC) curve using the best model on the test dataset
+
+Prerequisites:
+We need to update numpy (used by SageMaker Python SDK) in able to run this example. We only need to do it once for each session. To carry out this step, open the Terminal in RStudio (below) and run the following command:
+sudo /opt/python/3.9.5/bin/python -m pip install --no-user --force-reinstall --no-binary numpy numpy
+
+Once the installation is complete, go to Session tab in RStudio menu bar and restart R by clicking on "Restart R"
+  
+
+Clearing up the workspace and installing necessary packages if not already installed
+```{r}
+rm(list = ls())
+packages_new <- c("rstudioapi", "reticulate", "dplyr", "sys", "readr", "ggplot2")
+to_install <- packages_new[!(packages_new %in% installed.packages()[,"Package"])]
+if(length(to_install)> 0){
+  install.packages(to_install)
+} 
+#setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+
+Setting up all the packages needed for this notebook, SageMaker session, region, S3 bucket and role. In addition also importing SageMaker Python SDK and SageMaker and AWS SDK for Python (boto3) along with reticulate to carry out various API calls to these two SDKs.
+```{r}
+suppressWarnings(library(dplyr))
+suppressWarnings(library(readr))
+suppressWarnings(library(sys))
+
+suppressWarnings(library(reticulate))
+path_to_python <- system("which python", intern = TRUE)
+use_python(path_to_python)
+boto3 <- import('boto3')
+sagemaker <- import('sagemaker')
+
+session <- sagemaker$Session()
+region <- session$boto_region_name
+bucket <- session$default_bucket()
+s3_prefix <- "R/diabetes-example"
+role_arn <- sagemaker$get_execution_role()
+print(role_arn)
+sm = boto3$Session()$client(service_name = "sagemaker", region_name = region)
+```
+
+Downloading the data from UC Irvine and unzipping the dataset
+```{r}
+system("wget https://archive.ics.uci.edu/ml/machine-learning-databases/00296/dataset_diabetes.zip")
+system("unzip dataset_diabetes.zip")
+```
+
+Reading the data file and dropping a few columns not needed for building the machine learning model
+```{r}
+#Read the csv diabetes dataset file
+df <- read_csv(file = "dataset_diabetes/diabetic_data.csv", col_names = TRUE, show_col_types = FALSE)
+drop <- c("encounter_id", "patient_nbr", "weight", "medical_specialty","payer_code")
+df <- df[,!(names(df) %in% drop)]
+```
+
+The original dataset has three categories in the target avriable. We are converting those to two categories here - whether the person will be readmitted or not
+```{r}
+#Converting the target variable "readmitted" to a variable with two classes (making both < 30 and > 30 as a positive class to make it a binary classification problem)
+indices_no <- which(df$readmitted == "NO")
+df$readmitted[indices_no] <- 0
+df$readmitted[-indices_no] <- 1
+df$readmitted <- as.factor(df$readmitted)
+#Moving the target variable column "readmitted" to the front of the table
+df <- df %>% relocate(readmitted)
+
+```
+
+Dividing the dataset into train, validation and test datasets and writing the csv files in current directory. We are not explicitly creating a validation dataset since SageMaker Autopilot automatically splits the training data into training and validation sets for fitting the models
+```{r}
+
+df_train <- df %>% sample_frac(size = 0.7)
+df_test <- anti_join(df, df_train)
+
+train_file_path = "dataset_diabetes/df_train.csv"
+test_file_path = "dataset_diabetes/df_test.csv"
+write_csv(df_train, train_file_path)
+
+# Remove target from test
+write_csv(df_test[-1], test_file_path, col_names = FALSE)
+```
+
+Writing the data to S3 bucket for the Autopilot model training job
+```{r}
+s3_train <- session$upload_data(path = 'dataset_diabetes/df_train.csv', key_prefix = sprintf("%s/train",s3_prefix))
+s3_test <- session$upload_data(path = 'dataset_diabetes/df_test.csv',   key_prefix = sprintf("%s/test",s3_prefix))
+```
+
+Specifying the number of candidates for Autopilot job, the basejob name, target variable name, rold and SageMaker session.
+For more information on Amazon SageMaker Autopilot, please see https://sagemaker-examples.readthedocs.io/en/latest/autopilot/index.html
+```{r}
+num_candidates <- as.integer(20)
+base_job_name <- paste('sm-R-diabetes', format(Sys.time(), '%Y%m%d-%H-%M-%S'), sep = '-')
+target_attribute_name <- "readmitted"
+automl <- sagemaker$AutoML(
+  role = role_arn,
+  target_attribute_name = target_attribute_name,
+  base_job_name = base_job_name,
+  sagemaker_session = session,
+  max_candidates = num_candidates
+)
+  
+```
+
+
+Starting the Autopilot job
+```{r}
+automl$fit(s3_train, job_name=base_job_name, wait=FALSE, logs=FALSE)
+```
+
+Printing the job status while waiting for the Autolilot job to finish
+```{r}
+
+describe_response <- automl$describe_auto_ml_job(job_name = base_job_name)
+paste(describe_response$AutoMLJobStatus, " - ", describe_response$AutoMLJobSecondaryStatus)
+job_run_status <- describe_response$AutoMLJobStatus
+
+while(job_run_status!= "Failed" & job_run_status != "Completed" & job_run_status != "Stopped"){
+    describe_response = automl$describe_auto_ml_job()
+    job_run_status = describe_response$AutoMLJobStatus
+    paste(describe_response$AutoMLJobStatus, " - ", describe_response$AutoMLJobSecondaryStatus)
+    Sys.sleep(30)
+}
+```
+
+Finding the best candidate model out of all the trained models. Here we are using F1 score as the objective metric (SageMaker Autopilot defaults to F1 score for binary classification if no metric is specified)
+```{r}
+best_candidate <- automl$describe_auto_ml_job(job_name = base_job_name)["BestCandidate"]
+best_candidate_name <- best_candidate$BestCandidate$CandidateName
+
+paste("CandidateName: ", best_candidate_name)
+paste("FinalAutoMLJobObjectiveMetricName: ", best_candidate$BestCandidate$FinalAutoMLJobObjectiveMetric$MetricName)
+
+paste("FinalAutoMLJobObjectiveMetricValue: ", best_candidate$BestCandidate$FinalAutoMLJobObjectiveMetric$Value)
+```
+
+Evualting the top N candidates and printing their objective metric values
+```{r}
+top_n_candidates <- as.integer(5)
+candidates <- automl$list_candidates(
+    job_name = base_job_name, sort_by="FinalObjectiveMetricValue", sort_order="Descending", max_results=top_n_candidates
+)
+
+for(i in 1:top_n_candidates){
+    candidate <- candidates[i]
+    print(paste("Candidate name: %s", candidate[[1]]$CandidateName))
+
+    print(paste("Objective metric name: ", candidate[[1]]$FinalAutoMLJobObjectiveMetric$MetricName))
+    print(paste("Objective metric value: ", candidate[[1]]$FinalAutoMLJobObjectiveMetric$Value))
+    cat("\n")
+    
+}
+```
+
+Specifying that we need both the predicted labels as well as probability associated with the prediction
+```{r}
+inference_response_keys <- list("predicted_label", "probability")
+```
+
+Run batch transform on the test data set for the best model 
+```{r}
+s3_transform_output_path <- paste("s3://", bucket, "/", s3_prefix, "/inference_results/", sep = "")
+
+best_model <- automl$create_model(
+        name=best_candidate_name,
+        candidate=best_candidate$BestCandidate,
+        inference_response_keys=inference_response_keys
+    )
+
+output_path <- paste(s3_transform_output_path, best_candidate_name, "/", sep = "")
+
+best_model_transformer <- best_model$transformer(
+        instance_count=as.integer(1),
+        instance_type="ml.m5.xlarge",
+        assemble_with="Line",
+        output_path=output_path
+)
+
+best_model_transformer$transform(
+        data=s3_test, split_type="Line", content_type="text/csv", wait=FALSE
+    )
+cat(paste("Starting the batch transform job for the best model named: ",          best_model_transformer$latest_transform_job$job_name, "\n",sep = ""))
+
+```
+
+Waiting for the transform job to finish
+
+```{r}
+pending_complete <- TRUE
+
+while(pending_complete == TRUE){
+    pending_complete <- FALSE
+    desc <- sm$describe_transform_job(TransformJobName=best_model_transformer$latest_transform_job$job_name)
+        if(desc$TransformJobStatus != "Failed" &  desc$TransformJobStatus != "Completed")
+            pending_complete <- TRUE
+    
+    cat(paste("The batch transform job is still running.\n", sep = ""))
+    Sys.sleep(30)
+}
+    
+
+cat(paste("Finished the batch transform job ", best_model_transformer$latest_transform_job$job_name, " with status ", desc$TransformJobStatus, "\n", sep = ""))
+  
+
+```
+Now reading the output file with batch transform results from Amazon S3 bucket
+```{r}
+sagemaker$s3$S3Downloader$download(paste(output_path,"df_test.csv.out",sep = ""), "batch_output")
+df_batch_output <- read_csv("batch_output/df_test.csv.out", col_names = c("prediction", "probability"))
+
+df_pred <- cbind.data.frame(df_test$readmitted, df_batch_output)
+colnames(df_pred)[1] <- "readmitted"
+```
+Displaying confusion matrix and other metrics obtained on the test dataset using the best model
+```{r}
+confusionMatrix(as.factor(df_pred$readmitted), as.factor(df_pred$prediction))
+```
+```{r}
+f1(df_test$readmitted, df_batch_output$prediction)
+
+
+
+TP <- length(which((df_test$readmitted == 1) &  (df_batch_output$prediction == 1)))
+FP <- length(which((df_test$readmitted == 0) &  (df_batch_output$prediction == 1)))
+FN <- length(which((df_test$readmitted == 1) &  (df_batch_output$prediction == 0)))
+
+precision <- TP / (TP+FP)
+recall <- TP / (TP+FN) 
+f1_score <- (2 * precision * recall) / (precision+recall)
+paste("F1 score on the validation set: ", f1_score)
+```
+
+Plotting the RC curve
+```{r}
+roc_diabetes <- roc(df_pred$readmitted, df_pred$probability)
+auc_diabetes <- roc_diabetes$auc
+
+ggroc(roc_diabetes, colour = 'red', size = 1.3) + ggtitle(paste0('Receiver Operating Characteristics (ROC) Curve ', '(AUC = ', round(auc_diabetes, digits = 3), ')'))
+```
+
+
+
+
+
+
